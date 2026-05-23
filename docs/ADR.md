@@ -67,23 +67,15 @@ flowchart TB
 
 
 
-| Requirement | Why PostgreSQL fits | Why SQLite / alternatives fall short |
-
-|-------------|---------------------|--------------------------------------|
-
-| Concurrent zone increments | Single-statement atomic `UPDATE … SET count = count + 1` with row-level write lock on one hot row; MVCC lets readers proceed | SQLite serializes writers; high contention on shared zone rows creates queue latency |
-
-| Fault workflow (multi-step) | One transaction spanning `SELECT FOR UPDATE` → `UPDATE mission` → `INSERT maintenance` with **READ COMMITTED** / row locks | SQLite has DB-level write lock; harder to reason about under parallel fault events |
-
-| Partial unique indexes | `CREATE UNIQUE INDEX … WHERE status = 'active'` — enforces “one active mission per vehicle” in the schema | SQLite added partial indexes late; semantics differ; not the target production engine for this workload |
-
-| Advisory locks | `pg_advisory_xact_lock(hashtext(key))` for HTTP idempotency without extra infrastructure | Not available in SQLite; Redis would add another moving part for a take-home |
-
-| JSONB for `error_codes` | Native JSONB type + GIN indexes if we scale queries | SQLite JSON is text-backed; fine for small data but weaker ecosystem |
-
-| Timestamps with TZ | `TIMESTAMP WITH TIME ZONE` stored in UTC consistently | Doable everywhere, but Postgres + asyncpg is the default production pairing for FastAPI |
-
-| Operational realism | Same engine used in production fleet/IoT backends: partitioning, replicas, PgBouncer | SQLite is excellent for embedded/edge, not for 50+ concurrent writers to shared counters |
+| Requirement | Why PostgreSQL Fits | Why SQLite / Alternatives Fall Short |
+|---|---|---|
+| **Concurrent zone increments** | Single-statement atomic `UPDATE ... SET count = count + 1` with row-level locking on the hot row. MVCC allows concurrent readers while writers operate safely. | SQLite serializes writers; contention on shared zone counters quickly becomes a bottleneck and increases queue latency under concurrent telemetry ingestion. |
+| **Fault workflow (multi-step transaction)** | A single ACID transaction can safely span `SELECT ... FOR UPDATE` → `UPDATE mission` → `INSERT maintenance_event` using row locks and `READ COMMITTED` isolation. | SQLite relies on database-level write locking, making concurrent fault processing harder to reason about and less scalable during parallel events. |
+| **Partial unique indexes** | Native support for partial indexes such as `CREATE UNIQUE INDEX ... WHERE status = 'active'`, enforcing rules like “one active mission per vehicle” directly at the schema level. | SQLite supports partial indexes, but semantics and production guarantees differ; it is not typically chosen for high-concurrency backend workloads. |
+| **Advisory locks** | `pg_advisory_xact_lock(hashtext(key))` enables lightweight transactional idempotency control without introducing external infrastructure. | SQLite does not support advisory locks. Using Redis or another coordination layer would add operational complexity for a take-home project. |
+| **JSONB for flexible telemetry/error payloads** | Native `JSONB` storage with optional `GIN` indexing provides efficient querying and future scalability for fields like `error_codes` or metadata. | SQLite JSON support is text-based and lacks the same indexing/query ecosystem maturity for evolving analytical workloads. |
+| **Timezone-safe timestamps** | `TIMESTAMP WITH TIME ZONE` provides consistent UTC storage and aligns naturally with FastAPI + `asyncpg` production patterns. | Possible elsewhere, but PostgreSQL offers the most battle-tested and standardized approach for distributed systems handling telemetry data. |
+| **Operational realism** | Matches real production fleet/IoT architectures with support for partitioning, replicas, connection pooling (`PgBouncer`), backups, and observability tooling. | SQLite is excellent for embedded/edge devices or lightweight local persistence, but not ideal for 50+ concurrent writers updating shared counters and workflows. |
 
 
 
@@ -611,18 +603,12 @@ RETURNING id;
 
 
 | Time | Transaction A | Transaction B |
-
-|------|-----------------|---------------|
-
-| T1 | `SELECT mission … FOR UPDATE` → locks row | |
-
-| T2 | | `SELECT mission … FOR UPDATE` → **blocks** waiting for A |
-
-| T3 | cancel + insert maintenance | (waiting) |
-
-| T4 | `COMMIT` → releases lock | |
-
-| T5 | | acquires lock; mission no longer `active` → **no row returned** → no second maintenance |
+|---|---|---|
+| **T1** | `SELECT mission ... FOR UPDATE` → acquires row lock on active mission | |
+| **T2** | | `SELECT mission ... FOR UPDATE` → blocked, waiting for Transaction A to release lock |
+| **T3** | Updates mission status to `cancelled` + inserts maintenance record | (still waiting) |
+| **T4** | `COMMIT` → releases row lock | |
+| **T5** | | Acquires lock; query condition no longer matches active mission → no row returned → avoids duplicate maintenance creation |
 
 **Sequence diagram (concurrent fault requests):**
 
@@ -816,12 +802,9 @@ WHERE mission_id IS NOT NULL;
 
 
 | Constraint | Prevents |
-
-|------------|----------|
-
-| `uq_missions_one_active_per_vehicle` | Two concurrent `active` missions for `v-06` |
-
-| `uq_maintenance_one_per_mission` | Double maintenance record if two fault handlers slip through |
+|---|---|
+| `uq_missions_one_active_per_vehicle` | Prevents multiple concurrent active missions for the same vehicle (e.g. two active missions for `v-06`) |
+| `uq_maintenance_one_per_mission` | Prevents duplicate maintenance records if multiple fault handlers attempt to process the same mission simultaneously |
 
 
 
@@ -944,22 +927,14 @@ flowchart LR
 
 
 | Ambiguity | Assumption |
-
-|-----------|------------|
-
-| Mission lifecycle | Each vehicle starts with one `active` mission at seed time. New missions after completion are out of scope. |
-
-| Fault transition trigger | Fault workflow runs on telemetry with `status=fault` **or** explicit `PATCH /vehicles/{id}/status` to fault, only on first transition (`previous_status <> 'fault'`). |
-
-| Idempotency | Optional `Idempotency-Key` header; replays are safe for retries, not required for normal clients. |
-
-| Anomaly deduplication | Each qualifying event creates anomaly rows (no dedup window except stale telemetry, which dedupes within 10s). |
-
-| Stale telemetry | Background task every 5s flags vehicles with `last_seen` > 10s ago. |
-
-| Vehicle IDs | Fixed set `v-01` … `v-50` seeded at startup. Unknown IDs on ingest are accepted (fleet may grow). |
-
-| Time zones | All timestamps stored and compared in UTC (`TIMESTAMPTZ`). |
+|---|---|
+| **Mission lifecycle** | Each vehicle starts with one `active` mission during seed initialization. Creating new missions after completion is considered out of scope for this take-home. |
+| **Fault transition trigger** | The fault workflow executes when telemetry arrives with `status = 'fault'` or via explicit `PATCH /vehicles/{id}/status` transitions to `fault`, but only on the first transition (`previous_status <> 'fault'`). |
+| **Idempotency** | Clients may optionally send an `Idempotency-Key` header. Replay protection exists for retry safety, but the header is not mandatory for standard ingestion flows. |
+| **Anomaly deduplication** | Every qualifying telemetry event generates anomaly rows independently. No generic deduplication window exists except for stale telemetry detection, which suppresses duplicates within 10 seconds. |
+| **Stale telemetry detection** | A background worker runs every 5 seconds and flags vehicles whose `last_seen` timestamp is older than 10 seconds. |
+| **Vehicle IDs** | Vehicles `v-01` through `v-50` are seeded at startup. Unknown vehicle IDs received during ingestion are still accepted to support fleet expansion scenarios. |
+| **Time zones** | All timestamps are stored, compared, and transmitted in UTC using `TIMESTAMPTZ`. |
 
 
 
@@ -968,18 +943,12 @@ flowchart LR
 
 
 | Type | Rule |
-
-|------|------|
-
-| `low_battery` | `battery_pct < 15` |
-
-| `overspeed` | `speed_mps > 5` |
-
-| `fault_state` | `status == fault` |
-
-| `error_codes` | `len(error_codes) > 0` |
-
-| `stale_telemetry` | No update for > 10 seconds (background checker) |
+|---|---|
+| `low_battery` | Triggered when `battery_pct < 15` |
+| `overspeed` | Triggered when `speed_mps > 5` |
+| `fault_state` | Triggered when `status = 'fault'` |
+| `error_codes` | Triggered when `len(error_codes) > 0` |
+| `stale_telemetry` | Triggered when no telemetry update is received for more than 10 seconds (detected by background checker) |
 
 
 
@@ -996,22 +965,14 @@ flowchart LR
 
 
 | Area | Change |
-
-|------|--------|
-
-| Ingest | Kafka/NATS queue; dedicated ingest workers; mandatory idempotency keys on events |
-
-| Database | Partition `telemetry_events` by time; read replicas for dashboard; connection pooling (PgBouncer) |
-
-| Zone counters | Redis `INCR` or sharded counters if Postgres hot-row contention on `zone_counts` appears |
-
-| Aggregates | Materialized views or Redis cache refreshed on write |
-
-| Stale detection | Stream processing (Flink) instead of polling loop |
-
-| WebSocket | Horizontal scale via Redis pub/sub fan-out |
-
-| Fault workflow | Outbox pattern for maintenance notifications to external CMMS |
+|---|---|
+| **Ingest pipeline** | Introduce Kafka or NATS with dedicated ingest workers and mandatory idempotency keys for event replay protection and backpressure handling. |
+| **Database layer** | Partition `telemetry_events` by time, add read replicas for dashboard workloads, and use `PgBouncer` for connection pooling. |
+| **Zone counters** | Move to Redis `INCR` operations or sharded counters if PostgreSQL hot-row contention emerges on `zone_counts`. |
+| **Aggregates & dashboards** | Use materialized views or Redis caching refreshed on write to reduce repeated aggregation costs. |
+| **Stale telemetry detection** | Replace polling-based background checks with stream processing systems such as Flink for scalable event-time detection. |
+| **WebSocket scaling** | Support horizontal scaling through Redis pub/sub fan-out between application instances. |
+| **Fault workflow integration** | Implement the outbox pattern for reliable delivery of maintenance notifications to external CMMS systems. |
 
 
 
@@ -1048,17 +1009,11 @@ flowchart LR
 
 
 | Module | Responsibility |
-
-|--------|----------------|
-
-| `app/services/ingest.py` | Transaction orchestration, `FOR UPDATE` on vehicle, idempotency integration |
-
-| `app/services/telemetry.py` | Atomic zone increment, fault transition SQL, fleet aggregate queries |
-
-| `app/services/idempotency.py` | `pg_advisory_xact_lock`, replay helpers |
-
-| `app/db/constraints.py` | Partial unique index DDL at startup |
-
-| `app/models/__init__.py` | Table definitions + SQLAlchemy `Index(…, postgresql_where=…)` |
+|---|---|
+| `app/services/ingest.py` | Coordinates the end-to-end ingestion transaction, including `SELECT ... FOR UPDATE` locking on vehicles/missions and idempotency integration. |
+| `app/services/telemetry.py` | Handles atomic zone counter updates, fault transition SQL workflows, anomaly generation, and fleet aggregate queries. |
+| `app/services/idempotency.py` | Provides replay protection utilities using `pg_advisory_xact_lock` and cached response helpers. |
+| `app/db/constraints.py` | Creates database-level constraints and partial unique indexes during application startup. |
+| `app/models/__init__.py` | Defines SQLAlchemy table models and PostgreSQL-specific indexes such as `Index(..., postgresql_where=...)`. |
 
 
