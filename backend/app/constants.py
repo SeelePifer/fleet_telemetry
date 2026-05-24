@@ -1,3 +1,10 @@
+from datetime import timezone
+
+try:
+    from datetime import UTC
+except ImportError:
+    UTC = timezone.utc  # Python 3.10 compatibility
+
 ZONES = [
     "inbound_dock_a",
     "inbound_dock_b",

@@ -59,6 +59,14 @@ pip install httpx
 python scripts/simulate_telemetry.py
 ```
 
+Or from the `scripts` folder:
+
+```bash
+cd backend/scripts
+pip install httpx
+python simulate_telemetry.py
+```
+
 ## API endpoints
 
 | Method | Path | Description |

@@ -12,7 +12,7 @@ Take-home project: ingest telemetry from 50 autonomous vehicles at ~1 Hz, detect
 
 The hardest correctness requirements are **concurrent writes** (many vehicles hitting the same zone row) and the **fault workflow** (cancel mission + create maintenance record exactly once, even under duplicate requests or race conditions). Those constraints drove the database engine choice and every SQL pattern documented below.
 
-**Diagram index:** system architecture (Context) · data model ER (§1) · telemetry ingest flow (§2) · fault transition (§2.3) · concurrent fault sequence (§2.3) · defense-in-depth (§3) · idempotency retry (§4) · transaction boundary (§5)
+**Diagram index:** system architecture (Context) · data model ER (§1) · telemetry ingest flow (§2) · fault transition (§2.3) · concurrent fault sequence (§2.3) · defense-in-depth (§3) · idempotency retry (§4) · transaction boundary (§5) · anomaly detection (§6)
 
 ### System architecture
 
@@ -938,17 +938,87 @@ flowchart LR
 
 
 
-### Anomaly definitions
+### Anomaly model
 
+**Definition:** An anomaly is a **persisted row in the `anomalies` table** that records a deviant condition for a vehicle at a point in time. Anomalies are **observations** (alerts for operators and the dashboard). They are separate from side-effect workflows such as cancelling a mission or creating a maintenance record.
 
+Each anomaly stores: `vehicle_id`, `anomaly_type`, human-readable `message`, `detected_at`, and optionally `telemetry_event_id` (null for background-detected stale telemetry).
 
-| Type | Rule |
-|---|---|
-| `low_battery` | Triggered when `battery_pct < 15` |
-| `overspeed` | Triggered when `speed_mps > 5` |
-| `fault_state` | Triggered when `status = 'fault'` |
-| `error_codes` | Triggered when `len(error_codes) > 0` |
-| `stale_telemetry` | Triggered when no telemetry update is received for more than 10 seconds (detected by background checker) |
+#### What is **not** an anomaly
+
+| Event | Anomaly? | Why |
+|-------|----------|-----|
+| Vehicle enters a zone (`zone_entered`) | No | Updates `zone_counts` and `vehicle_current_state.last_zone` only |
+| Normal status change (`idle` → `moving`) | No | Expected fleet behaviour |
+| Fault transition (cancel mission + maintenance) | No* | Workflow on `missions` / `maintenance_records`; may coincide with a `fault_state` anomaly |
+
+\*Entering `fault` **does** create a `fault_state` anomaly **and** may trigger the fault workflow — see below.
+
+#### Detection paths
+
+Anomalies are detected in **two independent paths**:
+
+```mermaid
+flowchart LR
+  subgraph sync [Synchronous — POST /telemetry]
+    t1[Telemetry event] --> rules[detect_anomalies]
+    rules --> a1[low_battery]
+    rules --> a2[overspeed]
+    rules --> a3[fault_state]
+    rules --> a4[error_codes]
+  end
+
+  subgraph async [Background — every 5s]
+    bg[stale_telemetry_checker] --> check{last_seen > 10s?}
+    check -->|yes, not duped| a5[stale_telemetry]
+  end
+
+  a1 & a2 & a3 & a4 & a5 --> table[(anomalies table)]
+```
+
+- **Synchronous (ingest):** `detect_anomalies()` in `app/services/telemetry.py` runs inside the same DB transaction as the telemetry POST. Thresholds are defined in `app/constants.py` (`LOW_BATTERY_THRESHOLD = 15`, `OVERSPEED_THRESHOLD_MPS = 5.0`).
+- **Asynchronous (background):** `stale_telemetry_checker()` in `app/main.py` scans `vehicle_current_state.last_seen` every 5 seconds and inserts `stale_telemetry` when no update arrived for more than `STALE_TELEMETRY_SECONDS` (10). Dedupes within that 10 s window so the same vehicle is not flagged repeatedly.
+
+#### Multiple anomalies per event
+
+A **single telemetry POST can produce zero, one, or several anomaly rows**. Rules are evaluated independently — for example, one event with low battery, high speed, and error codes creates three rows:
+
+```
+POST /telemetry  →  anomalies: [low_battery, overspeed, error_codes]
+```
+
+There is **no generic deduplication** across events: if a vehicle keeps sending low battery readings, each qualifying POST adds another `low_battery` row.
+
+#### `fault_state` anomaly vs fault transition workflow
+
+These are related but **not the same thing**:
+
+| | `fault_state` anomaly | Fault transition workflow |
+|---|----------------------|---------------------------|
+| **Purpose** | Record that the vehicle reported fault | Cancel active mission + create maintenance record |
+| **Trigger** | `status = 'fault'` on ingest or PATCH | First transition into fault (`previous_status <> 'fault'`) |
+| **Storage** | `anomalies` table | `missions` + `maintenance_records` |
+| **Idempotent re-fault** | New anomaly row each time fault telemetry arrives | No-op if already in fault (no second cancellation) |
+
+A vehicle can have a `fault_state` anomaly without an active mission to cancel (`mission_cancelled: false`). Conversely, the fault workflow can run without every anomaly type firing on the same event.
+
+#### How anomalies are exposed
+
+| Consumer | Mechanism |
+|----------|-----------|
+| **Dashboard** | `GET /vehicles` returns `latest_anomaly` per vehicle; WebSocket `fleet_snapshot` includes it every 2 s |
+| **REST API** | `GET /anomalies` with optional filters: `vehicle_id`, `start`, `end`, `limit` |
+| **Ingest response** | `POST /telemetry` returns `anomalies_detected: list[str]` (types only, not DB ids) |
+
+#### Anomaly type definitions
+
+| Type | Rule | Detected by |
+|------|------|-------------|
+| `low_battery` | `battery_pct < 15` | Ingest |
+| `overspeed` | `speed_mps > 5` | Ingest |
+| `fault_state` | `status = 'fault'` | Ingest |
+| `error_codes` | `len(error_codes) > 0` | Ingest |
+| `stale_telemetry` | No telemetry for > 10 s | Background checker (every 5 s) |
 
 
 

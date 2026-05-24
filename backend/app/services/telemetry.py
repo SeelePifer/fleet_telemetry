@@ -1,4 +1,6 @@
-from datetime import UTC, datetime
+from datetime import datetime
+
+from app.constants import UTC
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession

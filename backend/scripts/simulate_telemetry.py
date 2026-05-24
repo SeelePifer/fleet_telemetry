@@ -1,8 +1,10 @@
 import asyncio
 import random
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import httpx
+
+UTC = timezone.utc
 
 API_URL = "http://localhost:8000"
 VEHICLE_IDS = [f"v-{i:02d}" for i in range(1, 51)]
