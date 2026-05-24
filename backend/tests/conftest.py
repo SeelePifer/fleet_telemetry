@@ -1,6 +1,4 @@
-from datetime import datetime, timezone
-
-UTC = timezone.utc
+from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -8,6 +6,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app.api.routes import router
+from app.constants import UTC
 from app.db.session import get_db
 
 

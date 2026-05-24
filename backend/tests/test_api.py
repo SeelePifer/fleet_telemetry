@@ -1,12 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.constants import UTC
 from app.main import app
-
-UTC = timezone.utc
 
 
 async def test_post_telemetry_validation_error(api_client: AsyncClient) -> None:

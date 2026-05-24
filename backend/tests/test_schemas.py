@@ -1,11 +1,9 @@
-from datetime import datetime, timezone
-
-UTC = timezone.utc
+from datetime import datetime
 
 import pytest
 from pydantic import ValidationError
 
-from app.constants import LOW_BATTERY_THRESHOLD, OVERSPEED_THRESHOLD_MPS, ZONES
+from app.constants import LOW_BATTERY_THRESHOLD, OVERSPEED_THRESHOLD_MPS, UTC, ZONES
 from app.schemas import StatusUpdateIn, TelemetryIn
 
 
