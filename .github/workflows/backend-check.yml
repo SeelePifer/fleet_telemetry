@@ -20,24 +20,27 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install -r requirements-dev.txt
           pip install ruff
 
       - name: Ruff lint
-        run: ruff check app scripts
+        run: ruff check app scripts tests
 
       - name: Ruff format check
-        run: ruff format --check app scripts
+        run: ruff format --check app scripts tests
 
       - name: Compile Python modules
         run: python -m compileall -q app scripts
 
-      - name: Verify application imports
+      - name: Run unit tests
         env:
           DATABASE_URL: postgresql+asyncpg://fleet:fleet@localhost:5432/fleet_telemetry
-        run: python -c "from app.main import app; assert app.title"
+        run: pytest -v

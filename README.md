@@ -67,6 +67,24 @@ pip install httpx
 python simulate_telemetry.py
 ```
 
+## Tests
+
+### Backend (pytest)
+
+```bash
+cd backend
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+### Frontend (Vitest)
+
+```bash
+cd frontend
+npm install
+npm run test
+```
+
 ## API endpoints
 
 | Method | Path | Description |
